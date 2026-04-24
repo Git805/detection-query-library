@@ -1,0 +1,56 @@
+# Lateral Movement via SMB — KQL (Microsoft Sentinel)
+# MITRE ATT&CK: T1021.002 — Remote Services: SMB/Windows Admin Shares
+# Author: Charudatta Padhye
+# Date: 2025-04-25
+# Reference: https://attack.mitre.org/techniques/T1021/002/
+#
+# Description:
+#   Detects lateral movement attempts using SMB by identifying hosts
+#   making administrative share connections (ADMIN$, C$, IPC$) to
+#   multiple internal destinations within a short time window.
+#   Adversaries use SMB admin shares for tool transfer, remote execution,
+#   and lateral movement post-compromise.
+#
+# Tested against: Cobalt Strike SMB lateral movement, Impacket psexec/smbexec,
+#   CrackMapExec SMB module, Metasploit SMB exploits
+#
+# Tuning:
+#   Increase threshold (count > 5) to reduce FP in environments with
+#   legitimate IT admin tools. Add known IT admin workstations to exclusion list.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+let timeWindow = 10m;
+let threshold = 3;
+let excludedHosts = dynamic(["known-admin-workstation", "sccm-server", "backup-server"]);
+
+NetworkFileShareEvents
+| where TimeGenerated > ago(1h)
+| where ShareName in ("ADMIN$", "C$", "IPC$")
+| where DeviceName !in (excludedHosts)
+| where RemoteIPType == "Private"  // Internal lateral movement only
+| summarize
+    UniqueDestinations = dcount(RemoteIP),
+    DestinationList = make_set(RemoteIP),
+    SharesAccessed = make_set(ShareName),
+    ConnectionCount = count()
+    by DeviceName, bin(TimeGenerated, timeWindow)
+| where UniqueDestinations >= threshold
+| extend
+    MITRETechnique = "T1021.002",
+    Tactic = "Lateral Movement",
+    Severity = iff(UniqueDestinations >= 5, "High", "Medium"),
+    Description = strcat("Host ", DeviceName, " accessed admin shares on ",
+        UniqueDestinations, " unique destinations in ", timeWindow)
+| project
+    TimeGenerated,
+    SourceHost = DeviceName,
+    UniqueDestinations,
+    DestinationList,
+    SharesAccessed,
+    ConnectionCount,
+    Severity,
+    MITRETechnique,
+    Tactic,
+    Description
+| order by UniqueDestinations desc
