@@ -1,0 +1,95 @@
+# Persistence via Registry Run Keys — KQL (Microsoft Sentinel)
+# MITRE ATT&CK: T1547.001 — Boot or Logon Autostart Execution: Registry Run Keys
+# Author: Charudatta Padhye
+# Date: 2025-04-25
+# Reference: https://attack.mitre.org/techniques/T1547/001/
+#
+# Description:
+#   Detects persistence mechanisms using Windows Registry Run keys.
+#   Adversaries add entries to Run/RunOnce keys to execute malicious
+#   payloads on system startup or user logon. Detection covers both
+#   HKLM (system-wide) and HKCU (per-user) persistence locations.
+#
+#   High-fidelity when combined with process creation events showing
+#   the spawned child process — correlate with DeviceProcessEvents
+#   for confirmation.
+#
+# Tested against: Cobalt Strike registry persistence, Empire persistence
+#   module, common RAT persistence mechanisms (AsyncRAT, NjRAT, Remcos)
+#
+# Tuning:
+#   Exclude known software installation processes (msiexec, setup.exe)
+#   as these legitimately modify Run keys during installation.
+#   Whitelist known-good registry values for your environment.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+let suspiciousLocations = dynamic([
+    "\\AppData\\Local\\Temp\\",
+    "\\AppData\\Roaming\\",
+    "\\Users\\Public\\",
+    "\\ProgramData\\",
+    "\\Windows\\Temp\\"
+]);
+
+let excludedProcesses = dynamic([
+    "msiexec.exe",
+    "setup.exe",
+    "installer.exe",
+    "MicrosoftEdgeUpdate.exe",
+    "GoogleUpdate.exe"
+]);
+
+let runKeys = dynamic([
+    "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+    "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+    "HKEY_CURRENT_USER\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+    "HKEY_CURRENT_USER\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+    "HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run"
+]);
+
+DeviceRegistryEvents
+| where TimeGenerated > ago(1h)
+| where ActionType in ("RegistryValueSet", "RegistryKeyCreated")
+| where RegistryKey has_any (runKeys)
+| where InitiatingProcessFileName !in (excludedProcesses)
+| extend RegistryValueData = tostring(RegistryValueData)
+| extend
+    IsSuspiciousPath = RegistryValueData has_any (suspiciousLocations),
+    IsEncodedCommand = RegistryValueData contains "powershell" and
+        (RegistryValueData contains "-enc" or
+         RegistryValueData contains "-EncodedCommand" or
+         RegistryValueData contains "base64"),
+    IsScriptExecution = RegistryValueData has_any
+        (dynamic(["wscript", "cscript", "mshta", "regsvr32", "rundll32"]))
+| extend
+    SuspicionScore = toint(IsSuspiciousPath) +
+                     toint(IsEncodedCommand) * 2 +
+                     toint(IsScriptExecution) * 2
+| where SuspicionScore >= 1
+| extend
+    MITRETechnique = "T1547.001",
+    Tactic = "Persistence",
+    Severity = case(
+        SuspicionScore >= 4, "High",
+        SuspicionScore >= 2, "Medium",
+        "Low"),
+    Description = strcat("Registry Run key modified by ", InitiatingProcessFileName,
+        " on ", DeviceName, ": ", RegistryKey, " → ", RegistryValueName)
+| project
+    TimeGenerated,
+    DeviceName,
+    InitiatingProcessFileName,
+    InitiatingProcessAccountName,
+    RegistryKey,
+    RegistryValueName,
+    RegistryValueData,
+    IsSuspiciousPath,
+    IsEncodedCommand,
+    IsScriptExecution,
+    SuspicionScore,
+    Severity,
+    MITRETechnique,
+    Tactic,
+    Description
+| order by SuspicionScore desc, TimeGenerated desc
