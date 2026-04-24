@@ -1,0 +1,94 @@
+# Defence Evasion via Living-off-the-Land Binaries (LOLBins) — KQL (Microsoft Sentinel)
+# MITRE ATT&CK: T1218 — System Binary Proxy Execution
+# Author: Charudatta Padhye
+# Date: 2025-04-25
+# Reference: https://attack.mitre.org/techniques/T1218/
+#
+# Description:
+#   Detects abuse of legitimate Windows binaries (LOLBins) for defence
+#   evasion, code execution, and proxy execution. Adversaries use built-in
+#   Windows tools to blend malicious activity with normal system operations,
+#   bypassing application whitelisting and reducing suspicion.
+#
+#   Covers the most commonly abused LOLBins observed in real intrusions:
+#   mshta, regsvr32, rundll32, certutil, msiexec, wmic, and others.
+#   Detection focuses on suspicious parent-child process relationships
+#   and unusual command-line arguments.
+#
+# Tested against: Cobalt Strike LOLBin execution, Empire launcher,
+#   TA505 mshta abuse, Emotet certutil download cradle
+#
+# Tuning:
+#   LOLBin detections are inherently noisy in enterprise environments.
+#   Start with mshta and certutil (lowest FP rate) before enabling all.
+#   Build exclusions based on your software deployment tools.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+let lolbins = dynamic([
+    "mshta.exe",        // HTML Application Host — executes HTA files
+    "regsvr32.exe",     // Register/unregister DLLs — squiblydoo technique
+    "certutil.exe",     // Certificate utility — download cradle abuse
+    "msiexec.exe",      // Windows Installer — remote MSI execution
+    "wmic.exe",         // WMI command line — remote execution
+    "cmstp.exe",        // Microsoft Connection Manager — UAC bypass
+    "msbuild.exe",      // Microsoft Build Engine — inline task execution
+    "installutil.exe",  // .NET installer — AppLocker bypass
+    "regasm.exe",       // .NET assembly registration
+    "regsvcs.exe"       // .NET component services
+]);
+
+let suspiciousParents = dynamic([
+    "winword.exe", "excel.exe", "powerpnt.exe",  // Office apps
+    "outlook.exe", "teams.exe",                   // Communication apps
+    "chrome.exe", "firefox.exe", "msedge.exe",   // Browsers
+    "explorer.exe"                                 // Windows Explorer
+]);
+
+let suspiciousArgs = dynamic([
+    "http://", "https://", "ftp://",   // Network download indicators
+    "\\\\",                             // UNC path (remote resource)
+    "base64",                           // Encoded payload
+    "hidden", "windowstyle h",         // Hidden execution
+    "scrobj.dll",                       // Script object for regsvr32
+    "/i:http"                           // Remote MSI installation
+]);
+
+DeviceProcessEvents
+| where TimeGenerated > ago(1h)
+| where FileName in~ (lolbins)
+| extend
+    HasSuspiciousParent = InitiatingProcessFileName in~ (suspiciousParents),
+    HasSuspiciousArgs = ProcessCommandLine has_any (suspiciousArgs),
+    IsNetworkArgs = ProcessCommandLine matches regex @"https?://[^\s]+"
+| extend
+    SuspicionScore = toint(HasSuspiciousParent) * 2 +
+                     toint(HasSuspiciousArgs) +
+                     toint(IsNetworkArgs) * 2
+| where SuspicionScore >= 1
+| extend
+    MITRETechnique = "T1218",
+    Tactic = "Defence Evasion",
+    Severity = case(
+        SuspicionScore >= 4, "High",
+        SuspicionScore >= 2, "Medium",
+        "Low"),
+    Description = strcat(FileName, " spawned by ", InitiatingProcessFileName,
+        " with suspicious arguments on ", DeviceName)
+| project
+    TimeGenerated,
+    DeviceName,
+    AccountName,
+    FileName,
+    ProcessCommandLine,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    HasSuspiciousParent,
+    HasSuspiciousArgs,
+    IsNetworkArgs,
+    SuspicionScore,
+    Severity,
+    MITRETechnique,
+    Tactic,
+    Description
+| order by SuspicionScore desc, TimeGenerated desc
