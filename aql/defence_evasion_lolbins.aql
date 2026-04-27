@@ -1,0 +1,134 @@
+-- Defence Evasion via LOLBin Execution — QRadar AQL
+-- MITRE ATT&CK: T1218 — System Binary Proxy Execution
+-- Author: Charudatta Padhye
+-- Date: 2025-04-25
+-- Reference: https://attack.mitre.org/techniques/T1218/
+--
+-- Description:
+--   Detects abuse of legitimate Windows binaries (LOLBins) for proxy
+--   execution and defence evasion. Focuses on suspicious parent-child
+--   process relationships and command-line indicators associated with
+--   real-world C2 frameworks and malware families.
+--
+--   Highest fidelity combinations from threat intelligence:
+--     - winword.exe → mshta.exe (Emotet, Dridex initial access)
+--     - excel.exe → regsvr32.exe (TA505, ISFB)
+--     - Any Office app → certutil.exe with URL (download cradle)
+--     - explorer.exe → msbuild.exe (AppLocker bypass)
+--
+-- Log Source: Windows Security Event Log (EventID 4688 — Process Creation)
+--   Requires: Command Line Auditing enabled in Group Policy
+--   Enable: Computer Config → Admin Templates → System → Audit Process Creation
+--
+-- Tuning:
+--   certutil.exe is heavily abused but also legitimately used by PKI teams.
+--   Add your PKI servers/accounts to exclusion list before enabling in prod.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+SELECT
+    sourceip AS "Host",
+    username AS "Account",
+    domainname AS "Domain",
+    "New Process Name" AS "LOLBin Process",
+    "Process Command Line" AS "Command Line",
+    "Parent Process Name" AS "Parent Process",
+    starttime AS "Execution Time",
+    CASE
+        WHEN "Parent Process Name" ILIKE '%winword.exe%'
+            OR "Parent Process Name" ILIKE '%excel.exe%'
+            OR "Parent Process Name" ILIKE '%powerpnt.exe%'
+            OR "Parent Process Name" ILIKE '%outlook.exe%'
+        THEN 'Office Application (High Risk)'
+        WHEN "Parent Process Name" ILIKE '%chrome.exe%'
+            OR "Parent Process Name" ILIKE '%firefox.exe%'
+            OR "Parent Process Name" ILIKE '%msedge.exe%'
+        THEN 'Browser (High Risk)'
+        WHEN "Parent Process Name" ILIKE '%explorer.exe%'
+        THEN 'Windows Explorer (Medium Risk)'
+        ELSE 'Other'
+    END AS "Parent Risk Level",
+    CASE
+        WHEN "Process Command Line" ILIKE '%http://%'
+            OR "Process Command Line" ILIKE '%https://%'
+        THEN 'Yes' ELSE 'No'
+    END AS "Network Download",
+    CASE
+        WHEN "Process Command Line" ILIKE '%-enc%'
+            OR "Process Command Line" ILIKE '%-EncodedCommand%'
+            OR "Process Command Line" ILIKE '%base64%'
+        THEN 'Yes' ELSE 'No'
+    END AS "Encoded Payload",
+    'T1218' AS "MITRE Technique",
+    'Defence Evasion' AS "Tactic",
+    CASE
+        WHEN (
+            "Parent Process Name" ILIKE '%winword.exe%'
+            OR "Parent Process Name" ILIKE '%excel.exe%'
+        ) AND (
+            "Process Command Line" ILIKE '%http%'
+            OR "Process Command Line" ILIKE '%-enc%'
+        ) THEN 'Critical'
+        WHEN "Parent Process Name" ILIKE '%winword.exe%'
+            OR "Parent Process Name" ILIKE '%excel.exe%'
+        THEN 'High'
+        WHEN "Process Command Line" ILIKE '%http://%'
+            OR "Process Command Line" ILIKE '%-enc%'
+        THEN 'Medium'
+        ELSE 'Low'
+    END AS "Severity"
+
+FROM events
+
+WHERE
+    -- Process creation event
+    eventid = 4688
+
+    -- LOLBin processes
+    AND (
+        "New Process Name" ILIKE '%mshta.exe%'
+        OR "New Process Name" ILIKE '%regsvr32.exe%'
+        OR "New Process Name" ILIKE '%certutil.exe%'
+        OR "New Process Name" ILIKE '%msiexec.exe%'
+        OR "New Process Name" ILIKE '%wmic.exe%'
+        OR "New Process Name" ILIKE '%cmstp.exe%'
+        OR "New Process Name" ILIKE '%msbuild.exe%'
+        OR "New Process Name" ILIKE '%installutil.exe%'
+        OR "New Process Name" ILIKE '%regasm.exe%'
+        OR "New Process Name" ILIKE '%regsvcs.exe%'
+    )
+
+    -- Must have at least one suspicious indicator
+    AND (
+        -- Suspicious parent process
+        "Parent Process Name" ILIKE '%winword.exe%'
+        OR "Parent Process Name" ILIKE '%excel.exe%'
+        OR "Parent Process Name" ILIKE '%powerpnt.exe%'
+        OR "Parent Process Name" ILIKE '%outlook.exe%'
+        OR "Parent Process Name" ILIKE '%chrome.exe%'
+        OR "Parent Process Name" ILIKE '%firefox.exe%'
+
+        -- Network download in command line
+        OR "Process Command Line" ILIKE '%http://%'
+        OR "Process Command Line" ILIKE '%https://%'
+        OR "Process Command Line" ILIKE '%\\\\%'
+
+        -- Encoding/obfuscation indicators
+        OR "Process Command Line" ILIKE '%-enc%'
+        OR "Process Command Line" ILIKE '%base64%'
+        OR "Process Command Line" ILIKE '%hidden%'
+
+        -- Specific LOLBin abuse patterns
+        OR "Process Command Line" ILIKE '%scrobj.dll%'    -- regsvr32 squiblydoo
+        OR "Process Command Line" ILIKE '%/i:http%'       -- remote MSI
+        OR "Process Command Line" ILIKE '%-urlcache%'     -- certutil download
+        OR "Process Command Line" ILIKE '%-decode%'       -- certutil decode
+    )
+
+    -- Exclude known legitimate usage
+    AND username NOT ILIKE '%SYSTEM%'
+    AND sourceip NOT IN ('10.0.0.5', '192.168.1.10')  -- SCCM/deployment servers
+
+    -- Last hour
+    AND starttime > NOW() - 1 HOURS
+
+ORDER BY "Severity" DESC, starttime DESC
