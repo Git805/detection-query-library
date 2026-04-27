@@ -1,0 +1,116 @@
+-- Persistence via Suspicious Scheduled Task Creation — QRadar AQL
+-- MITRE ATT&CK: T1053.005 — Scheduled Task/Job: Scheduled Task
+-- Author: Charudatta Padhye
+-- Date: 2025-04-25
+-- Reference: https://attack.mitre.org/techniques/T1053/005/
+--
+-- Description:
+--   Detects persistence via scheduled task creation with suspicious
+--   characteristics. Adversaries create scheduled tasks to maintain
+--   persistence, execute malicious payloads on schedule, or achieve
+--   privilege escalation via SYSTEM-level task execution.
+--
+--   Detection focuses on:
+--     - Tasks created by non-admin users (privilege escalation indicator)
+--     - Tasks executing from suspicious paths (Temp, AppData, ProgramData)
+--     - Tasks using LOLBin execution (powershell, cmd, wscript, mshta)
+--     - Tasks with encoded or obfuscated command lines
+--
+-- Log Source: Windows Security Event Log
+--   EventID 4698 — Scheduled Task Created
+--   EventID 4702 — Scheduled Task Updated
+--   Requires: Advanced Audit Policy — Audit Other Object Access Events
+--
+-- Tuning:
+--   Whitelist known software installation tasks (Windows Update, AV updates).
+--   Add your software deployment system account to username exclusion.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+SELECT
+    sourceip AS "Source Host",
+    username AS "Created By",
+    domainname AS "Domain",
+    "Task Name" AS "Task Name",
+    "Task Content" AS "Task Command",
+    starttime AS "Creation Time",
+    eventid AS "Event ID",
+    CASE
+        WHEN payload ILIKE '%\\AppData\\%'
+            OR payload ILIKE '%\\Temp\\%'
+            OR payload ILIKE '%\\ProgramData\\%'
+            OR payload ILIKE '%\\Users\\Public\\%'
+        THEN 'Yes' ELSE 'No'
+    END AS "Suspicious Path",
+    CASE
+        WHEN payload ILIKE '%powershell%' AND (
+            payload ILIKE '%-enc%'
+            OR payload ILIKE '%-EncodedCommand%'
+            OR payload ILIKE '%hidden%'
+        )
+        THEN 'Yes' ELSE 'No'
+    END AS "Encoded Command",
+    CASE
+        WHEN payload ILIKE '%mshta%'
+            OR payload ILIKE '%wscript%'
+            OR payload ILIKE '%cscript%'
+            OR payload ILIKE '%regsvr32%'
+            OR payload ILIKE '%rundll32%'
+        THEN 'Yes' ELSE 'No'
+    END AS "LOLBin Execution",
+    'T1053.005' AS "MITRE Technique",
+    'Persistence' AS "Tactic",
+    CASE
+        WHEN (
+            payload ILIKE '%\\Temp\\%'
+            OR payload ILIKE '%-enc%'
+            OR payload ILIKE '%mshta%'
+        ) THEN 'High'
+        WHEN payload ILIKE '%\\AppData\\%'
+            OR payload ILIKE '%wscript%'
+        THEN 'Medium'
+        ELSE 'Low'
+    END AS "Severity",
+    CONCAT(
+        'Scheduled task created by ', username,
+        ' on ', sourceip,
+        ': ', LEFT(payload, 200)
+    ) AS "Description"
+
+FROM events
+
+WHERE
+    -- Scheduled task creation or modification events
+    eventid IN (4698, 4702)
+
+    -- Exclude known legitimate task creators
+    AND username NOT ILIKE '%SYSTEM%'
+    AND username NOT ILIKE '%LOCAL SERVICE%'
+    AND username NOT ILIKE '%NETWORK SERVICE%'
+    AND username NOT IN ('svc-sccm', 'svc-backup', 'svc-wsus')
+
+    -- Focus on suspicious characteristics (at least one must match)
+    AND (
+        -- Suspicious execution paths
+        payload ILIKE '%\\AppData\\Local\\Temp\\%'
+        OR payload ILIKE '%\\AppData\\Roaming\\%'
+        OR payload ILIKE '%\\Users\\Public\\%'
+        OR payload ILIKE '%\\ProgramData\\%'
+
+        -- Encoded PowerShell
+        OR (payload ILIKE '%powershell%' AND payload ILIKE '%-enc%')
+        OR (payload ILIKE '%powershell%' AND payload ILIKE '%hidden%')
+
+        -- LOLBin execution
+        OR payload ILIKE '%mshta.exe%'
+        OR payload ILIKE '%wscript.exe%'
+        OR payload ILIKE '%regsvr32.exe%'
+
+        -- Network download indicator
+        OR payload ILIKE '%http://%'
+        OR payload ILIKE '%https://%'
+    )
+
+    -- Last hour
+    AND starttime > NOW() - 1 HOURS
+
+ORDER BY starttime DESC
