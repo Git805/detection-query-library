@@ -1,0 +1,97 @@
+-- C2 Beaconing via Periodic HTTPS Connections — QRadar AQL
+-- MITRE ATT&CK: T1071.001 — Application Layer Protocol: Web Protocols
+-- Author: Charudatta Padhye
+-- Date: 2025-04-25
+-- Reference: https://attack.mitre.org/techniques/T1071/001/
+--
+-- Description:
+--   Detects C2 beaconing over HTTPS by identifying internal hosts making
+--   repeated connections to the same external destination over port 443
+--   within a 10-minute window. High connection frequency to a single
+--   external IP indicates automated beaconing rather than human browsing.
+--
+--   This is the AQL implementation of the beaconing detection logic from
+--   the ML-Powered Encrypted Traffic Fingerprinting System project.
+--   The ML model achieves 94.7% precision — this rule-based version
+--   sacrifices some precision for simplicity and broad SIEM compatibility.
+--
+-- Log Source: Network flow logs (QRadar flow data) or firewall logs
+--   Requires: sourceip, destinationip, destinationport in flow events
+--
+-- Tuning:
+--   Add known monitoring/backup tool destination IPs to exclusion list.
+--   Increase minConnections threshold (15) for less noisy environments.
+--   Combine with JA3 anomaly detection for higher confidence alerting.
+--
+-- QRadar Deployment:
+--   Schedule every 10 minutes as a saved search.
+--   Trigger offense when result count > 0 AND destinationip not in whitelist.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+SELECT
+    sourceip AS "Source IP",
+    destinationip AS "Destination IP",
+    COUNT(*) AS "Connection Count",
+    SUM(eventcount) AS "Total Events",
+    SUM(bytessent + bytesreceived) AS "Total Bytes",
+    MIN(starttime) AS "First Connection",
+    MAX(starttime) AS "Last Connection",
+    DATEDIFF(MINUTE, MIN(starttime), MAX(starttime)) AS "Duration (mins)",
+    ROUND(
+        CAST(COUNT(*) AS FLOAT) /
+        NULLIF(DATEDIFF(MINUTE, MIN(starttime), MAX(starttime)), 0),
+        2
+    ) AS "Connections per Minute",
+    'T1071.001' AS "MITRE Technique",
+    'Command and Control' AS "Tactic",
+    CASE
+        WHEN COUNT(*) >= 20 THEN 'High'
+        WHEN COUNT(*) >= 10 THEN 'Medium'
+        ELSE 'Low'
+    END AS "Severity",
+    CONCAT(
+        sourceip, ' made ', COUNT(*), ' connections to ',
+        destinationip, ':443 in 10 minutes — potential C2 beacon'
+    ) AS "Description"
+
+FROM events
+
+WHERE
+    -- HTTPS port only
+    destinationport = 443
+
+    -- Internal source (RFC1918)
+    AND (
+        sourceip INCIDR '10.0.0.0/8'
+        OR sourceip INCIDR '172.16.0.0/12'
+        OR sourceip INCIDR '192.168.0.0/16'
+    )
+
+    -- External destination only
+    AND destinationip NOT INCIDR '10.0.0.0/8'
+    AND destinationip NOT INCIDR '172.16.0.0/12'
+    AND destinationip NOT INCIDR '192.168.0.0/16'
+    AND destinationip NOT INCIDR '127.0.0.0/8'
+
+    -- Exclude known CDN and cloud ranges
+    AND destinationip NOT INCIDR '13.32.0.0/15'      -- AWS CloudFront
+    AND destinationip NOT INCIDR '104.16.0.0/13'     -- Cloudflare
+    AND destinationip NOT INCIDR '142.250.0.0/15'    -- Google
+
+    -- Exclude known legitimate destinations (add your environment's IPs)
+    AND destinationip NOT IN (
+        '8.8.8.8', '8.8.4.4',          -- Google DNS
+        '1.1.1.1', '1.0.0.1'           -- Cloudflare DNS
+    )
+
+    -- Time window: last 10 minutes
+    AND starttime > NOW() - 10 MINUTES
+
+GROUP BY
+    sourceip,
+    destinationip
+
+-- Minimum connection threshold for beaconing classification
+HAVING COUNT(*) >= 5
+
+ORDER BY "Connection Count" DESC
