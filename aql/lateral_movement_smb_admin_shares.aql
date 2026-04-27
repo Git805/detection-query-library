@@ -1,0 +1,76 @@
+-- Lateral Movement via SMB Admin Shares — QRadar AQL
+-- MITRE ATT&CK: T1021.002 — Remote Services: SMB/Windows Admin Shares
+-- Author: Charudatta Padhye
+-- Date: 2025-04-25
+-- Reference: https://attack.mitre.org/techniques/T1021/002/
+--
+-- Description:
+--   Detects lateral movement via SMB by identifying source IPs connecting
+--   to administrative shares (ADMIN$, C$, IPC$) on multiple internal
+--   destinations within a 10-minute window. Threshold of 3 unique
+--   destinations balances detection sensitivity against IT admin FP.
+--
+-- Log Source: Windows Security Event Log (EventID 5140 — share accessed)
+--   or Network flow logs with SMB protocol detection
+--
+-- Tuning:
+--   Add known IT admin hosts to NOT sourceip IN (...) exclusion list.
+--   Increase threshold from 3 to 5 for noisier environments.
+--
+-- QRadar Deployment:
+--   1. Save as Custom AQL Search
+--   2. Schedule to run every 10 minutes
+--   3. Create Offense Rule triggering on result count > 0
+-- ─────────────────────────────────────────────────────────────────────────────
+
+SELECT
+    sourceip AS "Source Host",
+    COUNT(DISTINCT destinationip) AS "Unique Destinations",
+    COUNT(*) AS "Total Connections",
+    ARRAY_AGG(DISTINCT destinationip) AS "Destination IPs",
+    ARRAY_AGG(DISTINCT username) AS "Usernames",
+    MIN(starttime) AS "First Seen",
+    MAX(starttime) AS "Last Seen",
+    'T1021.002' AS "MITRE Technique",
+    'Lateral Movement' AS "Tactic",
+    CASE
+        WHEN COUNT(DISTINCT destinationip) >= 5 THEN 'High'
+        WHEN COUNT(DISTINCT destinationip) >= 3 THEN 'Medium'
+        ELSE 'Low'
+    END AS "Severity"
+
+FROM events
+
+WHERE
+    -- SMB port
+    destinationport = 445
+
+    -- Windows share access event or SMB protocol
+    AND (
+        eventid = 5140  -- Network Share Object Was Accessed
+        OR category = 'SMB Protocol Activity'
+    )
+
+    -- Administrative shares only
+    AND (
+        payload ILIKE '%ADMIN$%'
+        OR payload ILIKE '%C$%'
+        OR payload ILIKE '%IPC$%'
+    )
+
+    -- Internal source to internal destination (lateral movement)
+    AND sourceip INCIDR '10.0.0.0/8'
+        OR sourceip INCIDR '172.16.0.0/12'
+        OR sourceip INCIDR '192.168.0.0/16'
+
+    -- Exclude known IT admin hosts (add your environment's hosts here)
+    AND sourceip NOT IN ('192.168.1.10', '10.0.0.5')  -- SCCM, backup servers
+
+    -- Time window: last 10 minutes
+    AND starttime > NOW() - 10 MINUTES
+
+GROUP BY sourceip
+
+HAVING COUNT(DISTINCT destinationip) >= 3
+
+ORDER BY "Unique Destinations" DESC
